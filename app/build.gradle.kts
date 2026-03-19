@@ -55,7 +55,8 @@ dependencies {
     implementation(libs.material)
     implementation(libs.androidx.activity)
     implementation(libs.androidx.constraintlayout)
-
+    // NFC
+    implementation("androidx.core:core-ktx:1.15.0")
     // DataStore
     implementation(libs.androidx.datastore.core)
     implementation("androidx.datastore:datastore:1.1.3")
