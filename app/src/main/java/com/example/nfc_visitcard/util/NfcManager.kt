@@ -1,152 +1,238 @@
 package com.example.nfc_visitcard.util
 
 import android.app.Activity
-import android.app.PendingIntent
 import android.content.Intent
+import android.nfc.NdefMessage
+import android.nfc.NdefRecord
 import android.nfc.NfcAdapter
-import android.nfc.Tag
-import android.nfc.tech.Ndef
-import android.nfc.tech.NdefFormatable
-import android.widget.Toast
+import android.os.Build
+import android.util.Log
 import com.example.nfc_visitcard.data.model.UserProfile
+import com.example.nfc_visitcard.service.HceNdefService  // ✅ ДОБАВИТЬ ЭТОТ ИМПОРТ!
+import java.nio.charset.Charset
 
 class NfcManager(private val activity: Activity) {
 
+    companion object {
+        private const val TAG = "NfcManager"
+        // ✅ Можно удалить неиспользуемую константу
+        // private const val MIME_TYPE_VCARD = "text/x-vcard"
+    }
+
     private val nfcAdapter: NfcAdapter? = NfcAdapter.getDefaultAdapter(activity)
+    private var listener: NfcP2PListener? = null
 
-    private var pendingIntent: PendingIntent? = null
-    private var ndefMessage: android.nfc.NdefMessage? = null
-
-    // Проверка наличия NFC
-    fun isNfcAvailable(): Boolean {
-        return nfcAdapter != null
+    interface NfcP2PListener {
+        fun onProfileReceived(profile: UserProfile)
+        fun onNfcStarted()
+        fun onNfcComplete()
+        fun onNfcError(error: String)
     }
 
-    // Проверка включён ли NFC
-    fun isNfcEnabled(): Boolean {
-        return nfcAdapter?.isEnabled == true
+    fun setP2PListener(listener: NfcP2PListener?) {
+        this.listener = listener
     }
 
-    // Создание vCard из профиля
-    fun createVCard(profile: UserProfile): String {
-        val fullName = profile.fullName
-        val phone = profile.phoneNumber
-        val socialUrl = profile.socialUrl
+    fun isNfcAvailable(): Boolean = nfcAdapter != null
+    fun isNfcEnabled(): Boolean = nfcAdapter?.isEnabled == true
 
-        return buildString {
-            appendLine("BEGIN:VCARD")
-            appendLine("VERSION:3.0")
-            appendLine("FN:$fullName")
-            appendLine("N:;$fullName;;;")
-            if (phone.isNotEmpty()) {
-                appendLine("TEL;TYPE=CELL:$phone")
-            }
-            if (socialUrl.isNotEmpty()) {
-                appendLine("URL:$socialUrl")
-            }
-            appendLine("END:VCARD")
-        }
+    fun isHceSupported(): Boolean {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT &&
+                activity.packageManager.hasSystemFeature("android.hardware.nfc.hce")
     }
 
-    // Создание NDEF сообщения из vCard
-    fun createNdefMessage(vCard: String): android.nfc.NdefMessage {
-        val record = android.nfc.NdefRecord(
-            android.nfc.NdefRecord.TNF_MIME_MEDIA,
-            "text/vcard".toByteArray(),
-            ByteArray(0),
-            vCard.toByteArray(Charsets.UTF_8)
-        )
-        return android.nfc.NdefMessage(arrayOf(record))
-    }
+    /**
+     * ✅ Включаем HCE с полными данными профиля
+     */
+    fun enableHce(fullName: String, phoneNumber: String, socialUrl: String) {
+        Log.d(TAG, "========== enableHCE ==========")
+        Log.d(TAG, "Имя: $fullName")
+        Log.d(TAG, "Телефон: $phoneNumber")
+        Log.d(TAG, "URL: $socialUrl")
 
-    // Настройка NFC для записи
-    fun enableNfcWrite(profile: UserProfile) {
         if (!isNfcAvailable()) {
-            Toast.makeText(activity, "NFC not available on this device", Toast.LENGTH_LONG).show()
+            listener?.onNfcError("NFC не доступен")
             return
         }
 
         if (!isNfcEnabled()) {
-            Toast.makeText(activity, "Please enable NFC in settings", Toast.LENGTH_LONG).show()
+            listener?.onNfcError("Включите NFC в настройках")
             return
         }
 
-        // Создаём vCard и NDEF сообщение
-        val vCard = createVCard(profile)
-        ndefMessage = createNdefMessage(vCard)
-
-        // Настраиваем PendingIntent для обработки тега
-        val intent = Intent(activity, activity.javaClass).apply {
-            addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        if (!isHceSupported()) {
+            listener?.onNfcError("HCE не поддерживается")
+            return
         }
-        pendingIntent = PendingIntent.getActivity(
-            activity,
-            0,
-            intent,
-            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
 
-        // Включаем Reader Mode
-        nfcAdapter?.enableReaderMode(
-            activity,
-            { tag -> onTagDiscovered(tag, profile) },
-            NfcAdapter.FLAG_READER_NFC_A or NfcAdapter.FLAG_READER_NFC_B,
-            null
-        )
+        // ✅ Передаём ВСЕ данные в HCE службу
+        HceNdefService.setVCardData(fullName, phoneNumber, socialUrl)
 
-        Toast.makeText(activity, "Ready to write! Tap NFC tag or another phone", Toast.LENGTH_LONG).show()
+        Log.d(TAG, "✅ HCE включён")
+        listener?.onNfcStarted()
     }
 
-    // Обработка обнаруженного тега
-    private fun onTagDiscovered(tag: Tag, profile: UserProfile) {
-        try {
-            val ndef = Ndef.get(tag)
+    fun disableHce() {
+        HceNdefService.disableEmulation()
+        Log.d(TAG, "HCE выключен")
+    }
 
-            if (ndef != null) {
-                // Тег уже отформатирован как NDEF
-                ndef.connect()
+    /**
+     * Обрабатывает полученное NDEF сообщение
+     */
+    fun handleReceivedIntent(intent: Intent?) {
+        Log.d(TAG, "📥 handleReceivedIntent: ${intent?.action}")
 
-                if (!ndef.isWritable) {
-                    activity.runOnUiThread {
-                        Toast.makeText(activity, "Tag is not writable", Toast.LENGTH_LONG).show()
+        if (intent?.action != NfcAdapter.ACTION_NDEF_DISCOVERED) return
+
+        val messages = getNdefMessages(intent)
+        messages?.firstOrNull()?.let { ndefMessage ->
+            parseNdefMessage(ndefMessage)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun getNdefMessages(intent: Intent): Array<NdefMessage>? {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableArrayExtra(NfcAdapter.EXTRA_NDEF_MESSAGES, NdefMessage::class.java)
+        } else {
+            intent.getParcelableArrayExtra(NfcAdapter.EXTRA_NDEF_MESSAGES)
+        }?.filterIsInstance<NdefMessage>()?.toTypedArray()
+    }
+
+    /**
+     * ✅ Парсит NDEF сообщение и извлекает vCard + URI
+     */
+    private fun parseNdefMessage(message: NdefMessage) {
+        var fullName = ""
+        var phoneNumber = ""
+        var socialUrl = ""
+
+        Log.d(TAG, "📥 Записей в сообщении: ${message.records.size}")
+
+        for (i in message.records.indices) {
+            val record = message.records[i]
+            try {
+                Log.d(TAG, "📥 Запись $i:")
+                Log.d(TAG,  "  TNF: ${record.tnf}")
+                Log.d(TAG,  "  Type: ${String(record.type, Charset.forName("US-ASCII"))}")
+                Log.d(TAG,  "  Payload size: ${record.payload.size}")
+                Log.d(TAG,  "  Payload: ${String(record.payload, Charset.forName("UTF-8"))}")
+
+                // ✅ Парсим URI запись (tel:)
+                if (record.tnf == NdefRecord.TNF_WELL_KNOWN) {
+                    val type = String(record.type, Charset.forName("US-ASCII"))
+
+                    if (type == "U") { // URI Record
+                        val uri = parseUriRecord(record)
+                        Log.d(TAG, "📥 URI: $uri")
+
+                        if (uri.startsWith("tel:")) {
+                            phoneNumber = uri.substringAfter("tel:")
+                            Log.d(TAG, "  ✅ Телефон: $phoneNumber")
+                        } else if (uri.startsWith("http")) {
+                            socialUrl = uri
+                            Log.d(TAG, "  ✅ URL: $socialUrl")
+                        }
                     }
-                    return
-                }
 
-                ndef.writeNdefMessage(ndefMessage)
-                ndef.close()
-
-                activity.runOnUiThread {
-                    Toast.makeText(activity, "Profile written successfully! 🎉", Toast.LENGTH_LONG).show()
+                    // ✅ Парсим Text Record (имя)
+                    if (type == "T") { // Text Record
+                        val text = parseTextRecord(record)
+                        fullName = text
+                        Log.d(TAG, "  ✅ Имя: $fullName")
+                    }
                 }
-            } else {
-                // Тег нужно отформатировать
-                val formatable = NdefFormatable.get(tag)
-                formatable?.connect()
-                formatable?.format(ndefMessage)
-                formatable?.close()
-
-                activity.runOnUiThread {
-                    Toast.makeText(activity, "Profile written successfully! 🎉", Toast.LENGTH_LONG).show()
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-            activity.runOnUiThread {
-                Toast.makeText(activity, "Error: ${e.message}", Toast.LENGTH_LONG).show()
+            } catch (e: Exception) {
+                Log.e(TAG, "Ошибка парсинга записи $i", e)
             }
         }
+
+        Log.d(TAG, "📦 Итог: Имя=$fullName, Тел=$phoneNumber, URL=$socialUrl")
+
+        // ✅ Создаём профиль ТОЛЬКО для сохранения в контакты
+        val receivedProfile = UserProfile.newBuilder()
+            .setFullName(fullName)
+            .setPhoneNumber(phoneNumber)
+            .setSocialUrl(socialUrl)
+            .build()
+
+        listener?.onProfileReceived(receivedProfile)
+        listener?.onNfcComplete()
     }
 
-    // Отключение NFC при паузе
-    fun disableNfc() {
-        nfcAdapter?.disableReaderMode(activity)
+    /**
+     * ✅ Парсит Text Record
+     */
+    private fun parseTextRecord(record: NdefRecord): String {
+        val payload = record.payload
+        if (payload.isEmpty()) return ""
+
+        // Первый байт: статус (бит 7-6 = 0, бит 5 = UTF-8/UTF-16, бит 4-0 = длина языка)
+        val statusByte = payload[0].toInt() and 0xFF
+        val languageCodeLength = statusByte and 0x3F
+
+        // Язык начинается с байта 1
+        val textStart = 1 + languageCodeLength
+
+        if (textStart >= payload.size) return ""
+
+        val textBytes = payload.copyOfRange(textStart, payload.size)
+        return String(textBytes, Charset.forName("UTF-8"))
     }
 
-    // Включение NFC при возобновлении
-    fun enableNfc(profile: UserProfile) {
-        if (isNfcAvailable() && isNfcEnabled()) {
-            enableNfcWrite(profile)
+    private fun parseUriRecord(record: NdefRecord): String {
+        val payload = record.payload
+        if (payload.isEmpty()) return ""
+
+        val prefixCode = payload[0].toInt() and 0xFF
+        val uriBody = String(payload.copyOfRange(1, payload.size), Charset.forName("UTF-8"))
+
+        val prefixes = mapOf(
+            0x00 to "",
+            0x03 to "http://",
+            0x04 to "https://",
+            0x05 to "tel:",
+            0x06 to "mailto:"
+        )
+
+        val prefix = prefixes[prefixCode] ?: ""
+        return prefix + uriBody
+    }
+
+    private fun parseVCard(vCardData: String): ParsedContact {
+        var fullName = ""
+        var phoneNumber = ""
+        var socialUrl = ""
+
+        Log.d(TAG, "🔍 Парсим vCard:\n$vCardData")
+
+        vCardData.lines().forEach { line ->
+            val trimmed = line.trim()
+            Log.d(TAG, "  Строка: $trimmed")
+
+            when {
+                trimmed.startsWith("FN:") -> {
+                    fullName = trimmed.substringAfter("FN:").trim()
+                    Log.d(TAG, "  ✅ Имя: $fullName")
+                }
+                trimmed.startsWith("TEL:") -> {
+                    phoneNumber = trimmed.substringAfter("TEL:").trim()
+                    Log.d(TAG, "  ✅ Телефон: $phoneNumber")
+                }
+                trimmed.startsWith("URL:") -> {
+                    socialUrl = trimmed.substringAfter("URL:").trim()
+                    Log.d(TAG, "  ✅ URL: $socialUrl")
+                }
+            }
         }
+
+        return ParsedContact(fullName, phoneNumber, socialUrl)
     }
+
+    data class ParsedContact(
+        val fullName: String,
+        val phoneNumber: String,
+        val socialUrl: String
+    )
 }

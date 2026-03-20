@@ -1,9 +1,14 @@
 package com.example.nfc_visitcard
 
+import android.Manifest
+import android.content.ContentValues
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.nfc.NfcAdapter
+import android.os.Build
 import android.os.Bundle
+import android.provider.ContactsContract
 import android.util.Log
 import android.widget.Button
 import android.widget.EditText
@@ -11,22 +16,23 @@ import android.widget.ImageView
 import android.widget.Toast
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import com.bumptech.glide.Glide
 import com.example.nfc_visitcard.data.DataStoreManager
 import com.example.nfc_visitcard.data.model.UserProfile
-import com.example.nfc_visitcard.service.HceNdefService  // ← ИМПОРТ HCE!
 import com.example.nfc_visitcard.ui.viewmodel.ProfileViewModel
 import com.example.nfc_visitcard.util.NfcManager
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
-import android.content.pm.PackageManager
 
 private const val TAG = "NFC_DEBUG"
+private const val PERMISSIONS_REQUEST_CODE = 100
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : AppCompatActivity(), NfcManager.NfcP2PListener {
 
     private lateinit var viewModel: ProfileViewModel
     private lateinit var dataStoreManager: DataStoreManager
@@ -44,10 +50,7 @@ class MainActivity : AppCompatActivity() {
     private val pickMedia = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         if (uri != null) {
             currentAvatarUri = uri
-            Glide.with(this)
-                .load(uri)
-                .circleCrop()
-                .into(ivUserAvatar)
+            Glide.with(this).load(uri).circleCrop().into(ivUserAvatar)
         } else {
             Toast.makeText(this, "No image selected", Toast.LENGTH_SHORT).show()
         }
@@ -57,131 +60,139 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        Log.d(TAG, "========== onCreate STARTED ==========")
+        Log.d(TAG, "========== onCreate ==========")
+        Log.d(TAG, "Android: ${Build.VERSION.SDK_INT}")
+        Log.d(TAG, "Device: ${Build.MANUFACTURER} ${Build.MODEL}")
 
-        // Инициализация View
         etUserName = findViewById(R.id.userName)
         etUserPhoneNumber = findViewById(R.id.userPhoneNumber)
         etUserURL = findViewById(R.id.userURL)
         ivUserAvatar = findViewById(R.id.userAvatar)
         btnSave = findViewById(R.id.button)
 
-        // Инициализация менеджеров
         dataStoreManager = DataStoreManager(this)
-        nfcManager = NfcManager(this)
+        nfcManager = NfcManager(this).also { it.setP2PListener(this) }
 
         viewModel = ViewModelProvider(
             this,
             ProfileViewModel.Factory(dataStoreManager)
         )[ProfileViewModel::class.java]
 
-        // Проверка NFC + HCE
+        requestContactsPermission()
         checkNfcStatus()
-
-        // Наблюдение за профилем
         observeProfile()
-
-        // Наблюдение за статусом сохранения
         observeSaveStatus()
 
-        // Клик на кнопку Save
-        btnSave.setOnClickListener {
-            Log.d(TAG, "========== SAVE BUTTON CLICKED ==========")
-            saveProfile()
-        }
-
-        // Клик на аватар
+        btnSave.setOnClickListener { saveProfile() }
         ivUserAvatar.setOnClickListener {
             pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
         }
 
-        // Обработка NFC Intent
         handleNfcIntent(intent)
-
-        Log.d(TAG, "========== onCreate COMPLETED ==========")
     }
 
     override fun onResume() {
         super.onResume()
-        // ← HCE: Активируем эмуляцию при возврате в приложение
         currentProfile?.let { profile ->
-            if (nfcManager.isNfcAvailable() && nfcManager.isNfcEnabled()) {
-                enableHceEmulation(profile)
-            }
+            nfcManager.enableHce(
+                fullName = profile.fullName,
+                phoneNumber = profile.phoneNumber,
+                socialUrl = profile.socialUrl
+            )
         }
     }
 
-    override fun onPause() {
-        super.onPause()
-        // HCE можно оставить включённым или отключить
-        // HceNdefService.disableEmulation()
-    }
+    //override fun onPause() {
+    //    super.onPause()
+    //    nfcManager.disableHce()
+    //}
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleNfcIntent(intent)
     }
 
+    private fun requestContactsPermission() {
+        val permissions = arrayOf(
+            Manifest.permission.WRITE_CONTACTS,
+            Manifest.permission.READ_CONTACTS
+        )
+
+        val needRequest = permissions.any {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+
+        if (needRequest) {
+            requestPermissions(permissions, PERMISSIONS_REQUEST_CODE)
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == PERMISSIONS_REQUEST_CODE) {
+            if (grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+                Toast.makeText(this, "✅ Разрешение на контакты получено", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this, "⚠️ Контакты не сохранятся", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
     private fun checkNfcStatus() {
+        val nfcAdapter = NfcAdapter.getDefaultAdapter(this)
         when {
-            !nfcManager.isNfcAvailable() -> {
-                Toast.makeText(this, "NFC is not available on this device", Toast.LENGTH_LONG).show()
+            nfcAdapter == null -> {
+                Toast.makeText(this, "❌ NFC не доступен", Toast.LENGTH_LONG).show()
             }
-            !nfcManager.isNfcEnabled() -> {
-                Toast.makeText(this, "Please enable NFC in settings", Toast.LENGTH_LONG).show()
+            !nfcAdapter.isEnabled -> {
+                Toast.makeText(this, "⚠️ Включите NFC", Toast.LENGTH_LONG).show()
             }
-            // ← УДАЛИТЕ проверку FEATURE_NFC_HCE
+            !nfcManager.isHceSupported() -> {
+                Toast.makeText(this, "⚠️ HCE не поддерживается", Toast.LENGTH_LONG).show()
+            }
             else -> {
-                Log.d(TAG, "NFC + HCE ready!")
+                Toast.makeText(this, "✅ NFC + HCE готовы", Toast.LENGTH_LONG).show()
             }
         }
     }
 
     private fun observeProfile() {
         lifecycleScope.launch {
-            Log.d(TAG, "observeProfile started")
             viewModel.profile.collectLatest { profile ->
                 currentProfile = profile
+
+                // ✅ Загружаем данные в UI
                 etUserName.setText(profile.fullName)
                 etUserPhoneNumber.setText(profile.phoneNumber)
                 etUserURL.setText(profile.socialUrl)
 
-                if (profile.avatarPath.isNotEmpty()) {
-                    val uri = Uri.parse(profile.avatarPath)
-                    Glide.with(this@MainActivity)
-                        .load(uri)
-                        .circleCrop()
-                        .into(ivUserAvatar)
-                    currentAvatarUri = uri
-                }
-
-                // ← HCE: Обновляем эмуляцию при изменении профиля
+                // ✅ Включаем HCE с текущими данными
                 if (nfcManager.isNfcAvailable() && nfcManager.isNfcEnabled()) {
-                    enableHceEmulation(profile)
+                    nfcManager.enableHce(
+                        fullName = profile.fullName,
+                        phoneNumber = profile.phoneNumber,
+                        socialUrl = profile.socialUrl
+                    )
                 }
-
-                Log.d(TAG, "Profile loaded: ${profile.fullName}")
             }
         }
     }
 
     private fun observeSaveStatus() {
         lifecycleScope.launch {
-            Log.d(TAG, "observeSaveStatus started")
             viewModel.saveStatus.collectLatest { status ->
-                Log.d(TAG, "Save status: $status")
                 when (status) {
-                    is ProfileViewModel.SaveStatus.Loading -> {
-                        Toast.makeText(this@MainActivity, "Saving...", Toast.LENGTH_SHORT).show()
-                    }
                     is ProfileViewModel.SaveStatus.Success -> {
                         Toast.makeText(this@MainActivity, status.message, Toast.LENGTH_SHORT).show()
-                        // HCE уже обновляется через observeProfile
                     }
                     is ProfileViewModel.SaveStatus.Error -> {
-                        Toast.makeText(this@MainActivity, "Error: ${status.message}", Toast.LENGTH_LONG).show()
+                        Toast.makeText(this@MainActivity, "Ошибка: ${status.message}", Toast.LENGTH_LONG).show()
                     }
-                    is ProfileViewModel.SaveStatus.Idle -> {}
+                    else -> {}
                 }
             }
         }
@@ -189,81 +200,117 @@ class MainActivity : AppCompatActivity() {
 
     private fun handleNfcIntent(intent: Intent?) {
         if (intent?.action == NfcAdapter.ACTION_NDEF_DISCOVERED) {
-            Toast.makeText(this, "NFC tag detected!", Toast.LENGTH_SHORT).show()
+            Log.d(TAG, "📥 NDEF_DISCOVERED")
+            nfcManager.handleReceivedIntent(intent)
         }
     }
 
-    // ← HCE: Включаем эмуляцию NFC Tag с URI
-    private fun enableHceEmulation(profile: UserProfile) {
-        if (profile.fullName.isEmpty()) return
-
-        // Создаём ссылку на профиль
-        val profileUrl = buildProfileUrl(profile)
-
-        Log.d(TAG, "HCE: Setting URI = $profileUrl")
-        HceNdefService.setCurrentUri(profileUrl)
-
-        Toast.makeText(
-            this,
-            "NFC визитка активна!\nПриложите телефон к другому устройству",
-            Toast.LENGTH_LONG
-        ).show()
-    }
-
-    // ← HCE: Формируем URL для передачи
-    private fun buildProfileUrl(profile: UserProfile): String {
-        // Вариант 1: HTTPS ссылка (лучшая совместимость)
-        // Замените на ваш реальный домен
-        val domain = "yourdomain.com"
-        val username = profile.fullName.replace(" ", "_").replace("[^a-zA-Z0-9_]".toRegex(), "")
-        return "https://$domain/u/$username"
-
-        // Вариант 2: Tel ссылка (открывает набор номера)
-        // return "tel:${profile.phoneNumber}"
-
-        // Вариант 3: WhatsApp
-        // return "https://wa.me/${profile.phoneNumber}"
-
-        // Вариант 4: Deep link в ваше приложение
-        // return "nfcvisitcard://profile/${profile.id}"
-    }
-
     private fun saveProfile() {
-        Log.d(TAG, "========== saveProfile() CALLED ==========")
-
         val fullName = etUserName.text.toString().trim()
         val phoneNumber = etUserPhoneNumber.text.toString().trim()
         val socialUrl = etUserURL.text.toString().trim()
         val avatarPath = currentAvatarUri?.toString() ?: ""
 
-        Log.d(TAG, "Full Name: '$fullName'")
-        Log.d(TAG, "Phone: '$phoneNumber'")
-        Log.d(TAG, "URL: '$socialUrl'")
-        Log.d(TAG, "Avatar: '$avatarPath'")
-
         if (fullName.isEmpty()) {
-            Log.e(TAG, "Validation failed: Empty name")
-            etUserName.error = "Full Name is required"
-            etUserName.requestFocus()
+            etUserName.error = "Требуется имя"
             return
         }
-
         if (phoneNumber.isEmpty()) {
-            Log.e(TAG, "Validation failed: Empty phone")
-            etUserPhoneNumber.error = "Phone number is required"
-            etUserPhoneNumber.requestFocus()
+            etUserPhoneNumber.error = "Требуется телефон"
             return
         }
 
-        Log.d(TAG, "Calling viewModel.saveProfile()...")
+        viewModel.saveProfile(fullName, phoneNumber, socialUrl, avatarPath)
+    }
 
-        viewModel.saveProfile(
-            fullName = fullName,
-            phoneNumber = phoneNumber,
-            socialUrl = socialUrl,
-            avatarPath = avatarPath
-        )
+    // ==================== NfcP2PListener ====================
 
-        Log.d(TAG, "viewModel.saveProfile() completed")
+    override fun onProfileReceived(profile: UserProfile) {
+        Log.d(TAG, "📥 Получен: '${profile.fullName}', '${profile.phoneNumber}'")
+
+        // ✅ Проверяем что данные не пустые
+        if (profile.fullName.isEmpty() && profile.phoneNumber.isEmpty()) {
+            Log.e(TAG, "❌ Пустые данные! Не показываем диалог")
+            Toast.makeText(this, "❌ Не удалось получить данные контакта", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        lifecycleScope.launch {
+            // ✅ НЕ сохраняем в DataStore - только в контакты
+        }
+
+        showSaveContactDialog(profile)
+    }
+
+    private fun showSaveContactDialog(profile: UserProfile) {
+        Log.d(TAG, "Показываем диалог: ${profile.fullName}, ${profile.phoneNumber}")
+
+        AlertDialog.Builder(this)
+            .setTitle("💾 Сохранить контакт?")
+            .setMessage("Имя: ${profile.fullName.ifEmpty { "Неизвестно" }}\nТелефон: ${profile.phoneNumber.ifEmpty { "Не указан" }}")
+            .setPositiveButton("Сохранить") { _, _ ->
+                saveToContacts(profile)
+            }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
+
+    private fun saveToContacts(profile: UserProfile) {
+        try {
+            val rawContactValues = ContentValues().apply {
+                putNull(ContactsContract.RawContacts.ACCOUNT_TYPE)
+                putNull(ContactsContract.RawContacts.ACCOUNT_NAME)
+            }
+
+            val rawContactUri: Uri? = contentResolver.insert(
+                ContactsContract.RawContacts.CONTENT_URI,
+                rawContactValues
+            )
+
+            if (rawContactUri == null) {
+                Toast.makeText(this, "❌ Ошибка сохранения", Toast.LENGTH_LONG).show()
+                return
+            }
+
+            val rawContactId = rawContactUri.lastPathSegment ?: return
+
+            // Имя
+            ContentValues().apply {
+                put(ContactsContract.Data.RAW_CONTACT_ID, rawContactId)
+                put(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.StructuredName.CONTENT_ITEM_TYPE)
+                put(ContactsContract.CommonDataKinds.StructuredName.DISPLAY_NAME, profile.fullName)
+                contentResolver.insert(ContactsContract.Data.CONTENT_URI, this)
+            }
+
+            // Телефон
+            if (profile.phoneNumber.isNotEmpty()) {
+                ContentValues().apply {
+                    put(ContactsContract.Data.RAW_CONTACT_ID, rawContactId)
+                    put(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE)
+                    put(ContactsContract.CommonDataKinds.Phone.NUMBER, profile.phoneNumber)
+                    put(ContactsContract.CommonDataKinds.Phone.TYPE, ContactsContract.CommonDataKinds.Phone.TYPE_MOBILE)
+                    contentResolver.insert(ContactsContract.Data.CONTENT_URI, this)
+                }
+            }
+
+            Log.d(TAG, "✅ Контакт сохранён: ${profile.fullName}")
+            Toast.makeText(this, "✅ Контакт сохранён", Toast.LENGTH_LONG).show()
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Ошибка: ${e.message}", e)
+            Toast.makeText(this, "❌ ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    override fun onNfcStarted() {
+        Toast.makeText(this, "📱 Приложите телефон к другому устройству", Toast.LENGTH_LONG).show()
+    }
+
+    override fun onNfcComplete() {
+        Toast.makeText(this, "✅ Передача завершена!", Toast.LENGTH_SHORT).show()
+    }
+
+    override fun onNfcError(error: String) {
+        Toast.makeText(this, error, Toast.LENGTH_LONG).show()
     }
 }
